@@ -180,6 +180,11 @@ if (!MEET_URL && !login) {
   // mirrors your own camera). Other participants see it correctly.
   // =========================================================================
   await page.evaluateOnNewDocument(() => {
+    // Global variable that the canvas draw loop reads. Updated from Node via
+    // page.evaluate(() => window.__botText = "new text") whenever the user
+    // types in the terminal. Each keystroke updates immediately.
+    window.__botText = "Hello World";
+
     const originalGetUserMedia =
       navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
 
@@ -196,11 +201,42 @@ if (!MEET_URL && !login) {
           ctx.fillStyle = "#1a1a2e";
           ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+          // Read the current text from the global variable
+          const text = window.__botText || "";
           ctx.fillStyle = "#ffffff";
-          ctx.font = "bold 48px sans-serif";
-          ctx.textAlign = "center";
-          ctx.textBaseline = "middle";
-          ctx.fillText("Hello World", canvas.width / 2, canvas.height / 2);
+          ctx.font = "bold 36px sans-serif";
+          ctx.textAlign = "left";
+          ctx.textBaseline = "top";
+
+          // Split on explicit newlines first, then word-wrap each paragraph
+          const padding = 24;
+          const maxWidth = canvas.width - padding * 2;
+          const paragraphs = text.split("\n");
+          const lines = [];
+          for (const para of paragraphs) {
+            if (para === "") {
+              lines.push("");
+              continue;
+            }
+            const words = para.split(" ");
+            let currentLine = "";
+            for (const word of words) {
+              const testLine = currentLine ? currentLine + " " + word : word;
+              if (ctx.measureText(testLine).width > maxWidth && currentLine) {
+                lines.push(currentLine);
+                currentLine = word;
+              } else {
+                currentLine = testLine;
+              }
+            }
+            if (currentLine) lines.push(currentLine);
+          }
+
+          // Draw from the top-left corner
+          const lineHeight = 44;
+          for (let i = 0; i < lines.length; i++) {
+            ctx.fillText(lines[i], padding, padding + i * lineHeight);
+          }
 
           requestAnimationFrame(draw);
         }
@@ -494,17 +530,74 @@ if (!MEET_URL && !login) {
   }
 
   // =========================================================================
-  // IN-MEETING: wait for user to quit
+  // IN-MEETING: live text input
+  // Raw mode captures every keystroke. Printable characters are appended to
+  // the display text and pushed to the canvas immediately. Backspace removes
+  // the last character. Escape clears all text. Ctrl+C quits.
   // =========================================================================
-  console.log("\nBot is in the meeting. Press 'q' to leave gracefully.\n");
+  console.log("\nBot is in the meeting. Type freely — text appears on the video feed.");
+  console.log("  Enter = new line | Escape = clear all | Ctrl+C = leave\n");
 
   let leaving = false;
+  let displayText = "Hello World";
+
+  // Redraw the full text in the terminal. Avoids all cursor positioning bugs
+  // by clearing and reprinting everything on each change.
+  function redrawTerminal() {
+    process.stdout.write("\x1b[2J\x1b[H");
+    process.stdout.write(displayText);
+  }
+
+  async function pushToCanvas() {
+    await page.evaluate((t) => { window.__botText = t; }, displayText).catch(() => {});
+  }
+
+  redrawTerminal();
+
   process.stdin.setRawMode(true);
   process.stdin.resume();
-  process.stdin.on("data", (key) => {
-    const ch = key.toString();
-    if (ch === "q" || ch === "Q" || key[0] === 3) {
+  process.stdin.on("data", async (key) => {
+    if (leaving) return;
+
+    // Ctrl+C — quit
+    if (key[0] === 3) {
+      process.stdout.write("\n");
       leaveGracefully();
+      return;
+    }
+
+    // Escape — clear all text
+    if (key[0] === 27 && key.length === 1) {
+      displayText = "";
+      await pushToCanvas();
+      redrawTerminal();
+      return;
+    }
+
+    // Enter — newline
+    if (key[0] === 13) {
+      displayText += "\n";
+      await pushToCanvas();
+      redrawTerminal();
+      return;
+    }
+
+    // Backspace (127) or Delete (8)
+    if (key[0] === 127 || key[0] === 8) {
+      if (displayText.length > 0) {
+        displayText = displayText.slice(0, -1);
+      }
+      await pushToCanvas();
+      redrawTerminal();
+      return;
+    }
+
+    // Printable characters
+    const ch = key.toString();
+    if (ch && !ch.match(/[\x00-\x1f]/)) {
+      displayText += ch;
+      await pushToCanvas();
+      redrawTerminal();
     }
   });
 
