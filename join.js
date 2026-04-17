@@ -27,12 +27,24 @@
  *                          palette. Requires .venv/bin/python + transcribe.py.
  *
  * Other flags:
- *   --headless    Run Chrome without a visible window. Saves a debug screenshot
- *                 to /tmp/meet-bot-debug.png if auto-join fails.
+ *   --headed      Run Chrome with a visible window. Default is headless (no
+ *                 window). In headless mode a debug screenshot is saved to
+ *                 /tmp/meet-bot-debug.png if auto-join fails.
  *   --login       Open Chrome to sign into Google. One-time setup; the session
  *                 cookies persist in ~/.google-meet-test-chrome-profile.
+ *   --anonymous   Use a separate Chrome profile (~/.google-meet-test-chrome-
+ *                 profile-anon) that isn't signed in to any Google account.
+ *                 Meet shows the name-entry UI and the bot joins as `bot-name`.
+ *                 In --interactive, press `a` at runtime to toggle — this
+ *                 leaves the meeting, relaunches Chrome with the other profile,
+ *                 and rejoins the same URL.
+ *   --timing      Print a startup timing table after the bot joins. Marks
+ *                 each phase (detect URL → launchChrome → newPage → install
+ *                 hooks → goto → maybeMute → joinMeeting) with elapsed and
+ *                 cumulative ms. Use it to see where the 1-2s startup goes.
  *   bot-name      Name shown in Meet's participant list. Only used when joining
- *                 without a Google account. Default: "Meet Bot".
+ *                 without a Google account (i.e. --anonymous or a profile that
+ *                 hasn't been signed in yet). Default: "Meet Bot".
  *
  * Examples:
  *   node join.js meet.google.com/abc-defg-hij
@@ -88,10 +100,11 @@
  */
 
 const puppeteer = require("puppeteer-core");
-const { spawn } = require("child_process");
+const { spawn, execSync } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
+const readline = require("readline");
 
 // =========================================================================
 // ARGUMENT PARSING
@@ -107,11 +120,135 @@ function getValue(name, defaultVal) {
   return rawArgs[i + 1];
 }
 
-const headless = hasFlag("--headless");
+// Known-flag validation. The old parser silently treated any unrecognized
+// `--foo` as a positional arg, which meant a typo like `--timed` ended up
+// as the Meet URL and blew up with a Puppeteer ProtocolError deep in
+// setupSession. Catch it up front with a friendly message instead.
+const KNOWN_FLAGS = new Set([
+  "--headed",
+  "--login",
+  "--interactive",
+  "--anonymous",
+  "--timing",
+  "--help",
+  "-h",
+  "--mode",
+  "--source",
+]);
+for (let i = 0; i < rawArgs.length; i++) {
+  const a = rawArgs[i];
+  if (a.startsWith("-")) {
+    if (!KNOWN_FLAGS.has(a)) {
+      console.error(`Unknown option: ${a}`);
+      console.error("Run `node join.js --help` for the full flag list.");
+      process.exit(1);
+    }
+    // Skip the value for value-flags so it isn't re-evaluated as a flag.
+    if (a === "--mode" || a === "--source") i++;
+  }
+}
+
+if (hasFlag("--help") || hasFlag("-h")) {
+  process.stdout.write(
+    `Google Meet test bot — Puppeteer-driven Meet joiner
+
+Usage:
+  node join.js [<meet-url>] [bot-name] [options]
+
+If <meet-url> is omitted, the CLI auto-detects a Meet tab from Chrome
+(via AppleScript). In --interactive it boots parked and lets you pick
+or enter a URL at runtime.
+
+Modes — the bot's outgoing video:
+  --mode camera           (default) synthetic dark text canvas (1280x720)
+  --mode camera-overlay   real webcam + colored lower-third text pill
+  --mode presentation     bot joins as a PRESENTER (1920x1080 canvas via
+                          hooked getDisplayMedia — no screen picker)
+
+Sources — where the text comes from:
+  --source typed          (default) live keystrokes from this terminal
+  --source transcribed    live speech-to-text via transcribe.py (RealtimeSTT).
+                          Requires .venv/bin/python and the RealtimeSTT deps.
+
+Flags:
+  --interactive   Boot parked with a hotkey legend. In interactive mode
+                  you pick the mode at join time (1/2/3) and can hot-swap
+                  modes, toggle auth, leave/rejoin, and change URL live.
+  --headed        Run Chrome with a visible window. Default is headless.
+  --anonymous     Use a separate Chrome profile that isn't signed in to
+                  Google. The bot joins as <bot-name>.
+  --login         One-shot Google sign-in. Opens Chrome to accounts.google.com;
+                  session cookies persist in the profile dir.
+  --timing        Print a per-step startup timing table after each join.
+  --help, -h      Show this help and exit.
+
+Examples:
+  node join.js meet.google.com/abc-defg-hij
+  node join.js meet.google.com/abc-defg-hij --mode presentation --source transcribed
+  node join.js meet.google.com/abc-defg-hij --mode camera-overlay
+  node join.js --interactive
+  node join.js --login
+
+Interactive hotkeys — parked (before joining a meeting):
+  1 / 2 / 3   join in camera / camera-overlay / presentation mode
+  c           change the Meet URL (type it in)
+  Ctrl+C      quit
+
+Interactive hotkeys — in-meeting:
+  1 / 2 / 3   hot-swap to camera / camera-overlay / presentation mode
+  a           toggle auth mode (signed-in ↔ anonymous) — leaves and rejoins
+  l           leave the meeting and return to parked state
+  ?           show the in-meeting legend
+  Ctrl+C      quit
+`
+  );
+  process.exit(0);
+}
+
+// Headless is the default now. Pass --headed to pop a visible Chrome window
+// (useful for debugging the join flow, watching the canvas render, etc.).
+const headless = !hasFlag("--headed");
 const login = hasFlag("--login");
 const interactive = hasFlag("--interactive");
+const anonymous = hasFlag("--anonymous");
+const timingEnabled = hasFlag("--timing");
 const mode = getValue("--mode", "camera");
 const source = getValue("--source", "typed");
+
+// Startup timing harness. `--timing` collects per-step marks and prints a
+// flat elapsed/cumulative table after every session build. setupSession
+// resets the array at its entry so each join (initial, rejoin, auth-
+// toggle) gets its own clean timing table.
+const timings = [];
+function mark(label) {
+  if (!timingEnabled) return;
+  timings.push({ label, hr: process.hrtime.bigint() });
+}
+function printTimings() {
+  if (!timingEnabled || timings.length < 2) return;
+  const start = timings[0].hr;
+  const maxLabel = Math.max(4, ...timings.map((t) => t.label.length));
+  const pad = (s, n) => s.padEnd(n);
+  const rpad = (s, n) => s.padStart(n);
+  console.log("\nStartup timing:");
+  console.log(
+    "  " + pad("Step", maxLabel) + "   " + rpad("Elapsed", 10) + "   " + rpad("Cumulative", 12)
+  );
+  for (let i = 0; i < timings.length; i++) {
+    const t = timings[i];
+    const cum = Number(t.hr - start) / 1e6;
+    const elapsed = i === 0 ? 0 : Number(t.hr - timings[i - 1].hr) / 1e6;
+    console.log(
+      "  " +
+        pad(t.label, maxLabel) +
+        "   " +
+        rpad(elapsed.toFixed(1) + " ms", 10) +
+        "   " +
+        rpad(cum.toFixed(1) + " ms", 12)
+    );
+  }
+  console.log();
+}
 
 const VALID_MODES = ["camera", "camera-overlay", "presentation"];
 const VALID_SOURCES = ["typed", "transcribed"];
@@ -124,14 +261,15 @@ if (!VALID_SOURCES.includes(source)) {
   console.error(`Invalid --source: ${source}. Must be one of: ${VALID_SOURCES.join(", ")}`);
   process.exit(1);
 }
-if (interactive && headless) {
-  console.error("--interactive requires a real webcam, so it can't be used with --headless.");
-  process.exit(1);
-}
-
 // Strip flags AND their values when collecting positional args
 const valueFlagNames = new Set(["--mode", "--source"]);
-const booleanFlagNames = new Set(["--headless", "--login", "--interactive"]);
+const booleanFlagNames = new Set([
+  "--headed",
+  "--login",
+  "--interactive",
+  "--anonymous",
+  "--timing",
+]);
 const positional = [];
 for (let i = 0; i < rawArgs.length; i++) {
   if (booleanFlagNames.has(rawArgs[i])) continue;
@@ -141,12 +279,92 @@ for (let i = 0; i < rawArgs.length; i++) {
   }
   positional.push(rawArgs[i]);
 }
-const MEET_URL = positional[0];
+let MEET_URL = positional[0];
 const BOT_NAME = positional[1] || "Meet Bot";
 
+mark("start");
+
+// Auto-detect: if no URL was given, ask the user's real Chrome (via
+// AppleScript) for any open Meet tab and use that URL. Saves the usual
+// "copy URL from browser, paste into terminal" round trip. Only runs when
+// positional[0] is empty — passing a URL always wins.
 if (!MEET_URL && !login) {
-  console.error("Usage: node join.js <meet-url> [bot-name] [--mode camera|camera-overlay|presentation] [--source typed|transcribed] [--interactive] [--headless] [--login]");
-  process.exit(1);
+  const detected = detectMeetUrlFromChrome();
+  mark("detect URL");
+  if (detected) {
+    MEET_URL = detected;
+    console.log(`Auto-detected Meet URL from Chrome: ${MEET_URL}`);
+  } else if (!interactive) {
+    // Non-interactive mode must have a URL to do anything useful, so bail
+    // out with usage. Interactive mode boots parked — the user can supply
+    // the URL later by opening a Meet tab in Chrome and pressing J.
+    console.error(
+      "Usage: node join.js <meet-url> [bot-name] [--mode camera|camera-overlay|presentation] [--source typed|transcribed] [--interactive] [--anonymous] [--headed] [--login] [--timing]"
+    );
+    console.error(
+      "(Tip: open a Meet tab in Chrome and I'll auto-detect it — no URL argument needed.)"
+    );
+    process.exit(1);
+  }
+}
+
+// Ask the user's real Chrome for a currently-open Meet URL. Uses the
+// standard `tell application "Google Chrome" to get URL of tabs ...`
+// AppleScript bridge. Returns null if Chrome isn't running, the
+// AppleScript call fails, or no Meet tab is open. On first run macOS may
+// prompt for "System Events"/automation permission for the terminal.
+//
+// KNOWN LIMITATIONS (see project_next_steps memory for the full list):
+//  - Only checks Chrome. If the user has the Meet tab open in Safari,
+//    Arc, Brave, Edge, or Firefox, we return null and the caller prints
+//    the usage error. Generalizing to other browsers is on the backlog.
+//  - If multiple Meet tabs are open across Chrome's windows, we pick the
+//    first one AppleScript returns (generally leftmost in frontmost
+//    window). No prompting / disambiguation yet.
+//  - Regex deliberately requires the `xxx-yyyy-zzz` meeting-code format
+//    so landing pages like `meet.google.com/new` or the homepage don't
+//    match. If Google ever changes the code format, this breaks.
+//  - `execSync` is synchronous and blocks startup for up to 3s (timeout).
+//    That's the entire reason for the tight timeout — we don't want auto-
+//    detect to hang the CLI on a wedged AppleScript call.
+function detectMeetUrlFromChrome() {
+  try {
+    // Gate the AppleScript on a process check first. `tell application
+    // "Google Chrome"` will LAUNCH Chrome if it isn't running, which is
+    // surprising behavior for a passive "is there a Meet tab open?" probe.
+    // pgrep -x matches the exact process name and exits non-zero if nothing
+    // is running, which makes execSync throw and we fall through to null.
+    try {
+      execSync(`pgrep -x "Google Chrome"`, { stdio: "ignore", timeout: 1000 });
+    } catch {
+      console.log("\x1b[1;33m⚠  Chrome isn't running — skipping Meet URL auto-detect.\x1b[0m");
+      return null;
+    }
+    const out = execSync(
+      `osascript -e 'tell application "Google Chrome" to get URL of tabs of every window'`,
+      { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }
+    );
+    // osascript returns a single comma-separated line of URLs across all
+    // tabs of all windows. Find the first one that's an actual meeting
+    // (i.e. matches the xxx-yyyy-zzz code format — not the Meet home page
+    // or "new meeting" landing pages).
+    const meetRe = /https?:\/\/meet\.google\.com\/[a-z]{3}-[a-z]{3,4}-[a-z]{3}(?:[?#].*)?/i;
+    for (const piece of out.split(/,\s*/)) {
+      const m = piece.trim().match(meetRe);
+      if (m) return m[0];
+    }
+    // Chrome is running but no tab matched the meeting-code regex. Tell the
+    // user explicitly so they don't wonder why auto-detect "did nothing" —
+    // most likely cause is they're on meet.google.com/new or the homepage
+    // rather than inside an actual meeting.
+    console.log(
+      "\x1b[1;33m⚠  Chrome is running but no Meet tab with a meeting code was found.\x1b[0m"
+    );
+  } catch (e) {
+    // Chrome not running, AppleScript blocked, or timeout — silently fall
+    // through so the caller can print the regular usage error.
+  }
+  return null;
 }
 
 // =========================================================================
@@ -169,43 +387,165 @@ const PARTIAL_COLOR = "#fef08a"; // pale yellow
 
 const DEFAULT_TEXT = "Hello World";
 
+// Two persistent Chrome profile dirs. The signed-in one keeps Nick's Google
+// session so joinMeeting hits the "Join now" branch. The anonymous one is
+// never logged in, so joinMeeting hits the "Your name" branch and the bot
+// joins as BOT_NAME. Both persist across runs so Meet remembers per-site
+// settings (mic/camera permissions, layout preferences, etc.).
+const SIGNED_IN_PROFILE_DIR = `${os.homedir()}/.google-meet-test-chrome-profile`;
+const ANONYMOUS_PROFILE_DIR = `${os.homedir()}/.google-meet-test-chrome-profile-anon`;
+
 // =========================================================================
 // MAIN
 // =========================================================================
 (async () => {
   printConfig();
 
-  const browser = await launchChrome();
-  const page = await browser.newPage();
-  await page.setViewport({ width: 1280, height: 720 });
-
   // Login mode is a one-shot side flow that doesn't need any other setup.
   if (login) {
+    const browser = await launchChrome(anonymous);
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 720 });
     await runLoginFlow(page, browser);
     return;
   }
 
+  let currentAnonymous = anonymous;
+
+  // Non-interactive mode: build the session once, run the input loop, exit.
+  if (!interactive) {
+    const session = await setupSession(currentAnonymous);
+    printTimings();
+    process.on("SIGINT", () => session.exitHandler.leave());
+    await runInputLoop(session.page, session.exitHandler);
+    return;
+  }
+
+  // Interactive mode. SIGINT target is held in a mutable ref that we swap
+  // between the active session's exitHandler (when in a meeting) and a
+  // plain process.exit (when parked, since there's no session to tear
+  // down). Replacing the ref instead of re-attaching listeners avoids
+  // stacking multiple SIGINT handlers over time.
+  const sigintRef = { handler: { leave: () => process.exit(0) } };
+  process.on("SIGINT", () => sigintRef.handler.leave());
+
+  // Outer loop: parked ↔ active cycles. Each iteration waits in the idle
+  // loop until the user picks a mode with 1/2/3, builds a session, hands
+  // control to the active hotkey loop, and comes back here on park. The
+  // parked legend is printed by runIdleLoop, so no separate startup
+  // banner is needed here.
+  while (true) {
+    // --- PARKED PHASE ---
+    // runIdleLoop handles the 'c' (change URL) hotkey internally and only
+    // resolves once 1/2/3 is pressed. The returned mode is the entry mode
+    // for the active phase.
+    const idleResult = await runIdleLoop();
+    let initialMode = idleResult.mode;
+
+    console.log(`Joining ${MEET_URL} in ${initialMode} mode...`);
+
+    // --- ACTIVE PHASE ---
+    // Inner loop handles auth-toggle rebuilds WITHIN a meeting session. A
+    // switch-auth signal soft-leaves, flips the profile dir, and rebuilds
+    // in place, preserving the current mode across the rebuild. A park
+    // signal breaks out back to the outer parked phase.
+    let session = await setupSession(currentAnonymous);
+    printTimings();
+    sigintRef.handler = session.exitHandler;
+
+    let parked = false;
+    while (!parked) {
+      // Wait for the in-call UI before accepting hotkeys, otherwise pressing
+      // 3 immediately after launch would race the share-screen button.
+      await session.page
+        .waitForSelector('[aria-label="Leave call"]', {
+          visible: true,
+          timeout: 60000,
+        })
+        .catch(() => null);
+
+      const { signal, lastMode } = await runHotkeyLoop(
+        session.page,
+        session.exitHandler,
+        currentAnonymous,
+        initialMode
+      );
+
+      // runHotkeyLoop resolves with a rebuild signal. Ctrl+C routes
+      // through exitHandler.leave() which calls process.exit, so we never
+      // fall through to an unexpected return.
+      if (signal !== "switch-auth" && signal !== "park") return;
+
+      if (signal === "switch-auth") {
+        currentAnonymous = !currentAnonymous;
+        console.log(
+          `\nSwitching to ${currentAnonymous ? "anonymous" : "signed-in"} mode — leaving and rejoining...`
+        );
+        await softLeave(session.browser, session.page);
+        session = await setupSession(currentAnonymous);
+        printTimings();
+        sigintRef.handler = session.exitHandler;
+        initialMode = lastMode; // preserve the active mode across the rebuild
+      } else {
+        // park: soft-leave and break out to the outer parked phase.
+        console.log("\nLeaving meeting...");
+        await softLeave(session.browser, session.page);
+        sigintRef.handler = { leave: () => process.exit(0) };
+        parked = true;
+      }
+    }
+  }
+})().catch((err) => {
+  console.error("Fatal error:", err);
+  process.exit(1);
+});
+
+// Build one end-to-end Meet session: launch Chrome, install all hooks,
+// navigate, join the call, wire up the exit handler. Returns the three
+// handles callers need to drive the session.
+//
+// Called once in non-interactive mode, and once per auth-toggle in
+// interactive mode.
+async function setupSession(isAnonymous) {
+  // Reset timings at the start of every build so each join (initial,
+  // rejoin-from-parked, auth-toggle rebuild) prints its own clean table.
+  // The module-level mark("start") from the top of the file only covers
+  // the very first startup; subsequent builds re-anchor here.
+  timings.length = 0;
+  mark("start");
+  const browser = await launchChrome(isAnonymous);
+  mark("launchChrome");
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1280, height: 720 });
+  mark("newPage");
+
   await installAntiDetection(page);
+  mark("installAntiDetection");
   await installSharedPageState(page);
+  mark("installSharedPageState");
   await installModeHook(page);
+  mark("installModeHook");
 
   console.log(`Navigating to ${MEET_URL}...`);
   // domcontentloaded is faster than networkidle2. Meet is an SPA that loads
   // incrementally — we don't need every API call to finish, just a usable DOM.
   await page.goto(MEET_URL, { waitUntil: "domcontentloaded" });
+  mark("page.goto");
 
   await maybeMute(page);
+  mark("maybeMute");
 
   const joined = await joinMeeting(page);
+  mark("joinMeeting");
   if (!joined) {
     await browser.close();
     process.exit(1);
   }
 
-  // Presentation mode: wait until we're confirmed in the meeting, then click
-  // "Share screen" so Meet calls getDisplayMedia (our hook intercepts it).
-  // Interactive mode skips this — presentation only fires when the user
-  // hits hotkey 3.
+  // Presentation mode (non-interactive): wait until we're confirmed in the
+  // meeting, then click "Share screen" so Meet calls getDisplayMedia (our
+  // hook intercepts it). Interactive mode skips this — presentation only
+  // fires when the user hits hotkey 3.
   if (mode === "presentation" && !interactive) {
     await page
       .waitForSelector('[aria-label="Leave call"]', {
@@ -214,49 +554,76 @@ const DEFAULT_TEXT = "Hello World";
       })
       .catch(() => null);
     await startPresenting(page);
+    mark("startPresenting");
   }
 
-  // Set up exit handling AFTER we're in the call so Ctrl+C during join
-  // doesn't try to leave a meeting we never joined.
+  // Exit handler is per-session: it captures this specific browser + page.
+  // When we rebuild a session (anonymous toggle), the old handler is
+  // retired and replaced via sigintRef in the main loop.
   const exitHandler = createExitHandler(browser, page);
-  process.on("SIGINT", () => exitHandler.leave());
+  return { browser, page, exitHandler };
+}
 
-  // Interactive mode runs the hotkey loop instead of the typing loop.
-  if (interactive) {
-    // Wait for the in-call UI before accepting hotkeys, otherwise pressing
-    // 3 immediately after launch would race the share-screen button.
+// Leave the current meeting and close the browser WITHOUT calling
+// process.exit. Used by interactive mode when toggling --anonymous at
+// runtime — we need to tear the current session down cleanly so we can
+// relaunch Chrome under the other profile.
+//
+// Shorter than createExitHandler.leave() on purpose: we only try the two
+// most reliable click strategies (aria-label + text search) and skip the
+// "close the tab" fallback, because we're about to close the whole browser
+// anyway. The browser.close() is the real teardown; the clicks just give
+// Meet a chance to fire a clean "you left" signal to the host.
+async function softLeave(browser, page) {
+  try {
     await page
-      .waitForSelector('[aria-label="Leave call"]', {
-        visible: true,
-        timeout: 60000,
+      .evaluate(() => {
+        const btn = document.querySelector('[aria-label="Leave call"]');
+        if (btn) btn.click();
       })
-      .catch(() => null);
-    await runHotkeyLoop(page, exitHandler);
-  } else {
-    // Start the text source (typed or transcribed) and the terminal loop.
-    await runInputLoop(page, exitHandler);
+      .catch(() => {});
+    await sleep(300);
+
+    await page
+      .evaluate(() => {
+        const walker = document.createTreeWalker(
+          document.body,
+          NodeFilter.SHOW_TEXT,
+          null
+        );
+        while (walker.nextNode()) {
+          if (walker.currentNode.textContent.trim().includes("Leave call")) {
+            walker.currentNode.parentElement?.click();
+            return;
+          }
+        }
+      })
+      .catch(() => {});
+    await sleep(200);
+  } catch (e) {
+    // Fine — we're about to close the browser anyway.
   }
-})().catch((err) => {
-  console.error("Fatal error:", err);
-  process.exit(1);
-});
+  await browser.close().catch(() => {});
+}
 
 // =========================================================================
 // CONFIG / DIAGNOSTICS
 // =========================================================================
 function printConfig() {
   if (login) {
-    console.log("Mode: login (one-time Google sign-in)");
+    console.log(
+      `Mode: login (one-time Google sign-in)${anonymous ? " [anonymous profile]" : ""}`
+    );
     return;
   }
   if (interactive) {
     console.log(
-      `Config: interactive (hot-swap) source=${source} bot-name="${BOT_NAME}"`
+      `Config: interactive (hot-swap) source=${source} anonymous=${anonymous} bot-name="${BOT_NAME}"`
     );
     return;
   }
   console.log(
-    `Config: mode=${mode} source=${source} headless=${headless} bot-name="${BOT_NAME}"`
+    `Config: mode=${mode} source=${source} anonymous=${anonymous} headless=${headless} bot-name="${BOT_NAME}"`
   );
 }
 
@@ -265,9 +632,15 @@ function printConfig() {
 // Mode-aware: camera-overlay mode uses the REAL webcam, so it must NOT pass
 // --use-fake-device-for-media-stream. Presentation mode adds tab-capture
 // auto-accept flags as a safety net in case our JS hook misses.
+//
+// Profile-dir-aware: signed-in mode uses SIGNED_IN_PROFILE_DIR (keeps Nick's
+// Google session so Meet shows "Join now"); anonymous mode uses
+// ANONYMOUS_PROFILE_DIR (no Google session, so Meet shows the name input).
 // =========================================================================
-async function launchChrome() {
-  console.log(`Launching Chrome${headless ? " (headless)" : ""}...`);
+async function launchChrome(isAnonymous) {
+  console.log(
+    `Launching Chrome${headless ? " (headless)" : ""}${isAnonymous ? " [anonymous profile]" : ""}...`
+  );
 
   const chromeArgs = [
     // Hide navigator.webdriver = true (one of the signals sites use to
@@ -287,6 +660,14 @@ async function launchChrome() {
     // Chrome's spinning green pie chart. camera-overlay AND interactive want
     // the REAL webcam (interactive needs it so it can hot-swap into the
     // camera-overlay branch on demand).
+    //
+    // NOTE: This works in headless too — don't gate it on `headless`. On
+    // macOS, Chrome's webcam permission lives in the user data dir, so a
+    // previously-authorized persistent profile (like our
+    // SIGNED_IN_PROFILE_DIR) still gets real webcam access in headless mode.
+    // We USED to block `--interactive --headless` on the assumption that
+    // headless couldn't see a webcam — that assumption was wrong. Removed
+    // the block 2026-04-11.
     chromeArgs.push("--use-fake-device-for-media-stream");
   }
 
@@ -307,10 +688,11 @@ async function launchChrome() {
     // selectors since elements have no layout. Don't use "shell".
     headless: headless ? true : false,
     args: chromeArgs,
-    // Persistent profile. Keeps Google login session across runs (separate
-    // from the user's real Chrome profile to avoid interference). Previously
-    // /tmp; moved here so reboots don't wipe the session.
-    userDataDir: `${os.homedir()}/.google-meet-test-chrome-profile`,
+    // Persistent profile. Two dirs: a signed-in one (default) and an
+    // anonymous one (--anonymous). Separate from the user's real Chrome
+    // profile to avoid interference. Persists across runs so Meet remembers
+    // per-site settings.
+    userDataDir: isAnonymous ? ANONYMOUS_PROFILE_DIR : SIGNED_IN_PROFILE_DIR,
   });
 }
 
@@ -1241,7 +1623,7 @@ async function joinMeeting(page) {
       await page.screenshot({ path: screenshotPath, fullPage: true });
       console.log("\n⚠  Could not find the join UI automatically (headless mode).");
       console.log(`   Debug screenshot saved to: ${screenshotPath}`);
-      console.log("   Try again without --headless to debug.");
+      console.log("   Try again with --headed to debug.");
       return false;
     }
     console.log("\n⚠  Could not find the join UI automatically.");
@@ -1735,6 +2117,11 @@ async function runInputLoop(page, exitHandler) {
   let pythonProc = null;
   let displayText = DEFAULT_TEXT;
   let speechReady = false;
+  // First redraw skips the screen-clear so anything printed during startup
+  // (config, auto-detect line, --timing table) stays visible in scrollback.
+  // Once the user starts typing / transcribing, subsequent redraws clear as
+  // normal to maintain a stable input frame.
+  let firstDraw = true;
 
   // ----- Typed source: push the current text as a single white segment.
   async function pushTypedText() {
@@ -1755,7 +2142,12 @@ async function runInputLoop(page, exitHandler) {
 
   // ----- Terminal redraw — different layouts for typed vs transcribed.
   function redrawTerminal() {
-    process.stdout.write("\x1b[2J\x1b[H");
+    if (firstDraw) {
+      firstDraw = false;
+      process.stdout.write("\n");
+    } else {
+      process.stdout.write("\x1b[2J\x1b[H");
+    }
     process.stdout.write(
       `Mode: ${mode}  |  Source: ${source}  |  ${MEET_URL}\n`
     );
@@ -1890,13 +2282,23 @@ async function runInputLoop(page, exitHandler) {
 // identifies which mode you're looking at. Toggling to/from presentation
 // also drives Meet's Share screen / Stop sharing buttons so the
 // presentation surface actually appears for other participants.
+//
+// Returns a promise that resolves with "switch-auth" when the user presses
+// 'a' to toggle anonymous/signed-in mode. The caller is expected to tear
+// down this session and rebuild a new one. All other exit paths ('l',
+// Ctrl+C) call exitHandler.leave() which terminates the process, so in
+// practice this promise either resolves with "switch-auth" or never
+// resolves at all.
 // =========================================================================
-async function runHotkeyLoop(page, exitHandler) {
+async function runHotkeyLoop(page, exitHandler, isAnonymous, initialMode) {
   // Track presentation state on the Node side because Meet's UI is the
   // source of truth for whether we're sharing — we drive that via clicks.
   let isPresenting = false;
   // Current logical mode the user picked. Mirrored into window.__currentMode.
-  let currentMode = "camera";
+  // Seeded from initialMode — in interactive mode, the parked idle loop
+  // picks this via the 1/2/3 hotkeys; after an auth-toggle rebuild, the
+  // main loop passes the pre-rebuild mode here to preserve it.
+  let currentMode = initialMode || "camera";
 
   const MODE_LABELS = {
     camera: "Camera Mode",
@@ -1910,9 +2312,10 @@ async function runHotkeyLoop(page, exitHandler) {
       "  1   camera        (synthetic dark text canvas)",
       "  2   camera-overlay (real webcam + lower-third pill)",
       "  3   presentation  (text canvas + 1920x1080 slide via screen share)",
-      "  l   leave the meeting (graceful)",
+      `  a   toggle auth mode (currently: ${isAnonymous ? "anonymous" : "signed in"}) — leaves and rejoins`,
+      "  l   leave the meeting (stay parked — press j to rejoin)",
       "  ?   show this legend",
-      "  Ctrl+C   leave the meeting",
+      "  Ctrl+C   quit the CLI",
     ].join("\n");
   }
 
@@ -1920,7 +2323,9 @@ async function runHotkeyLoop(page, exitHandler) {
   // single status line without clearing — keeps the scrollback intact so
   // you can see the history of what you pressed.
   function printLegendOnce() {
-    process.stdout.write(`Interactive  |  ${MEET_URL}\n`);
+    process.stdout.write(
+      `Interactive  |  ${MEET_URL}  |  auth: ${isAnonymous ? "anonymous" : "signed in"}\n`
+    );
     process.stdout.write(legend() + "\n");
     process.stdout.write("─".repeat(72) + "\n");
   }
@@ -1962,8 +2367,16 @@ async function runHotkeyLoop(page, exitHandler) {
     await setSegmentsToLabel(MODE_LABELS[next]);
   }
 
-  // Initial state: camera mode, label set, no sharing.
-  await setCurrentMode("camera");
+  // Initial state: set the label for the chosen mode. If the caller chose
+  // presentation as the entry mode, kick off the Share-screen click here
+  // so the bot lands in the meeting already presenting. Camera and
+  // camera-overlay need no additional setup — installModeHook already
+  // wired getUserMedia / getDisplayMedia at session-build time.
+  await setCurrentMode(currentMode);
+  if (currentMode === "presentation") {
+    const ok = await startPresenting(page);
+    isPresenting = !!ok;
+  }
   printLegendOnce();
   printStatus();
 
@@ -1973,81 +2386,271 @@ async function runHotkeyLoop(page, exitHandler) {
   // race through the shared presentation state.
   let transitioning = false;
 
-  process.stdin.setRawMode(true);
-  process.stdin.resume();
-  process.stdin.on("data", async (key) => {
-    if (exitHandler.isLeaving()) return;
-
-    // Ctrl+C — leave.
-    if (key[0] === 3) {
-      process.stdout.write("\n");
-      exitHandler.leave();
-      return;
-    }
-
-    const ch = key.toString();
-
-    if (ch === "1" || ch === "2" || ch === "3") {
-      if (transitioning) return; // drop keystrokes during a transition
+  // Wrap the listener in a promise so the caller can await a rebuild signal
+  // ("switch-auth" = rebuild under the other profile, "park" = tear down
+  // and drop into the idle loop) without us ever actually returning from
+  // the function. Ctrl+C paths through exitHandler.leave() instead, which
+  // terminates the whole process and never resolves this promise.
+  return new Promise((resolve) => {
+    // Shared cleanup for any hotkey that wants the main loop to tear this
+    // session down (auth toggle, park). Stops any in-progress presentation
+    // so the soft-leave doesn't leave a dead share behind, detaches the
+    // stdin listener, and resolves with the caller-chosen signal. The main
+    // loop dispatches on the signal string.
+    const exitLoopWith = async (signal) => {
+      if (transitioning) return;
       transitioning = true;
-      try {
-        const next =
-          ch === "1" ? "camera" : ch === "2" ? "camera-overlay" : "presentation";
-
-        // If switching AWAY from presentation, end the presentation. We do
-        // it in two layers because neither alone has been reliable:
-        //   1. WebRTC teardown — null the screen-share sender's track and
-        //      stop the canvas source tracks. The page-side helper polls
-        //      up to 4s for Meet to actually establish the share before
-        //      tearing down, which protects against the start-then-stop-
-        //      quickly race.
-        //   2. UI click — click Meet's "Stop presenting" affordance.
-        //      Without this, Meet's UI state machine still considers
-        //      itself presenting and the blank tile hangs around.
-        // See feedback_stop_presenting_pattern memory for the rationale.
-        if (currentMode === "presentation" && next !== "presentation" && isPresenting) {
-          await page
-            .evaluate(() => {
-              return (
-                typeof window.__stopInteractivePresentation === "function" &&
-                window.__stopInteractivePresentation()
-              );
-            })
-            .catch(() => false);
-          // Small pause so Meet notices the track is gone and renders
-          // the "Stop presenting" affordance stably before the click.
-          await sleep(250);
-          await stopPresenting(page).catch(() => false);
-          isPresenting = false;
-        }
-
-        await setCurrentMode(next);
-
-        // If switching TO presentation, click Share screen so Meet calls
-        // getDisplayMedia (our hook returns the presentation canvas).
-        if (next === "presentation" && !isPresenting) {
-          const ok = await startPresenting(page);
-          isPresenting = !!ok;
-        }
-
-        printStatus();
-      } finally {
-        transitioning = false;
+      if (currentMode === "presentation" && isPresenting) {
+        await page
+          .evaluate(() => {
+            return (
+              typeof window.__stopInteractivePresentation === "function" &&
+              window.__stopInteractivePresentation()
+            );
+          })
+          .catch(() => false);
+        await sleep(250);
+        await stopPresenting(page).catch(() => false);
+        isPresenting = false;
       }
-      return;
-    }
+      // transitioning stays true — we're exiting this loop for good.
+      process.stdin.removeListener("data", handleKey);
+      // Drop raw mode so the next session (or a post-exit shell) doesn't
+      // inherit our terminal settings. The next runHotkeyLoop will flip
+      // it back on when it takes over.
+      if (process.stdin.isTTY) process.stdin.setRawMode(false);
+      process.stdin.pause();
+      // Return the current mode too so the main loop can preserve it
+      // across an auth-toggle rebuild (for park, the next join will pick
+      // its own mode via the idle loop so lastMode is unused).
+      resolve({ signal, lastMode: currentMode });
+    };
 
-    if (ch === "l" || ch === "L") {
-      process.stdout.write("\n");
-      exitHandler.leave();
-      return;
-    }
+    const handleKey = async (key) => {
+      if (exitHandler.isLeaving()) return;
 
-    if (ch === "?" || ch === "h" || ch === "H") {
-      printLegendOnce();
-      printStatus();
-      return;
-    }
+      // Ctrl+C — leave.
+      if (key[0] === 3) {
+        process.stdout.write("\n");
+        exitHandler.leave();
+        return;
+      }
+
+      const ch = key.toString();
+
+      if (ch === "1" || ch === "2" || ch === "3") {
+        if (transitioning) return; // drop keystrokes during a transition
+        transitioning = true;
+        // Per-switch phase timings. Only populated when --timing is on; the
+        // helper short-circuits otherwise so there's no overhead in the
+        // default path. Printed below printStatus() as one compact line.
+        const phases = [];
+        const timePhase = async (label, fn) => {
+          if (!timingEnabled) return fn();
+          const t0 = process.hrtime.bigint();
+          const result = await fn();
+          phases.push({
+            label,
+            ms: Number(process.hrtime.bigint() - t0) / 1e6,
+          });
+          return result;
+        };
+        try {
+          const next =
+            ch === "1"
+              ? "camera"
+              : ch === "2"
+                ? "camera-overlay"
+                : "presentation";
+
+          // If switching AWAY from presentation, end the presentation. We do
+          // it in two layers because neither alone has been reliable:
+          //   1. WebRTC teardown — null the screen-share sender's track and
+          //      stop the canvas source tracks. The page-side helper polls
+          //      up to 4s for Meet to actually establish the share before
+          //      tearing down, which protects against the start-then-stop-
+          //      quickly race.
+          //   2. UI click — click Meet's "Stop presenting" affordance.
+          //      Without this, Meet's UI state machine still considers
+          //      itself presenting and the blank tile hangs around.
+          // See feedback_stop_presenting_pattern memory for the rationale.
+          if (
+            currentMode === "presentation" &&
+            next !== "presentation" &&
+            isPresenting
+          ) {
+            await timePhase("stop present", async () => {
+              await page
+                .evaluate(() => {
+                  return (
+                    typeof window.__stopInteractivePresentation === "function" &&
+                    window.__stopInteractivePresentation()
+                  );
+                })
+                .catch(() => false);
+              // Small pause so Meet notices the track is gone and renders
+              // the "Stop presenting" affordance stably before the click.
+              await sleep(250);
+              await stopPresenting(page).catch(() => false);
+              isPresenting = false;
+            });
+          }
+
+          await timePhase("set mode", () => setCurrentMode(next));
+
+          // If switching TO presentation, click Share screen so Meet calls
+          // getDisplayMedia (our hook returns the presentation canvas).
+          if (next === "presentation" && !isPresenting) {
+            await timePhase("start present", async () => {
+              const ok = await startPresenting(page);
+              isPresenting = !!ok;
+            });
+          }
+
+          printStatus();
+          if (timingEnabled && phases.length) {
+            const total = phases.reduce((s, p) => s + p.ms, 0);
+            const parts = phases
+              .map((p) => `${p.label} ${p.ms.toFixed(0)} ms`)
+              .join(" → ");
+            process.stdout.write(
+              `   timing: ${parts}  (total ${total.toFixed(0)} ms)\n`
+            );
+          }
+        } finally {
+          transitioning = false;
+        }
+        return;
+      }
+
+      if (ch === "a" || ch === "A") {
+        // Toggle auth mode. Requires tearing down the current Chrome session
+        // and relaunching under the other profile dir, then rejoining the
+        // same Meet URL. The main loop handles the rebuild.
+        await exitLoopWith("switch-auth");
+        return;
+      }
+
+      if (ch === "l" || ch === "L") {
+        // Leave the current meeting but KEEP the CLI alive. Main loop enters
+        // an idle state where 'j' / 'J' can rebuild a session and rejoin.
+        // Full exit is Ctrl+C — `l` no longer quits the whole process in
+        // interactive mode.
+        await exitLoopWith("park");
+        return;
+      }
+
+      if (ch === "?" || ch === "h" || ch === "H") {
+        printLegendOnce();
+        printStatus();
+        return;
+      }
+    };
+
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on("data", handleKey);
+  });
+}
+
+// =========================================================================
+// IDLE (PARKED) LOOP
+// Runs in interactive mode before the first meeting AND after every 'l'
+// leave. No Chrome session is active while we're here. Hotkeys:
+//   1 / 2 / 3  → join the current MEET_URL in camera / overlay /
+//                presentation mode (resolves with {mode})
+//   c          → prompt for a new URL (line-mode readline, then stay parked)
+//   Ctrl+C     → quit (no session to soft-leave)
+// =========================================================================
+async function runIdleLoop() {
+  function printParkedPrompt() {
+    const urlLine = MEET_URL
+      ? `URL: ${MEET_URL}`
+      : `URL: (not set — press c to set one)`;
+    const lines = [
+      "",
+      `Parked  |  ${urlLine}`,
+      "  1   join in camera mode         (synthetic dark text canvas)",
+      "  2   join in camera-overlay mode (real webcam + lower-third pill)",
+      "  3   join in presentation mode   (text canvas + 1920x1080 slide)",
+      "  c   change the Meet URL (type it in)",
+      "  Ctrl+C   quit",
+      "─".repeat(72),
+    ];
+    process.stdout.write(lines.join("\n") + "\n");
+  }
+
+  printParkedPrompt();
+
+  return new Promise((resolve) => {
+    const handleKey = (key) => {
+      // Ctrl+C — nothing to leave, just quit.
+      if (key[0] === 3) {
+        process.stdin.removeListener("data", handleKey);
+        if (process.stdin.isTTY) process.stdin.setRawMode(false);
+        process.stdin.pause();
+        process.stdout.write("\n");
+        process.exit(0);
+      }
+
+      const ch = key.toString();
+
+      if (ch === "1" || ch === "2" || ch === "3") {
+        if (!MEET_URL) {
+          process.stdout.write(
+            "No URL set — press c to set one first.\n"
+          );
+          return;
+        }
+        const mode =
+          ch === "1"
+            ? "camera"
+            : ch === "2"
+              ? "camera-overlay"
+              : "presentation";
+        process.stdin.removeListener("data", handleKey);
+        if (process.stdin.isTTY) process.stdin.setRawMode(false);
+        process.stdin.pause();
+        resolve({ mode });
+        return;
+      }
+
+      if (ch === "c" || ch === "C") {
+        // Temporarily detach the raw-mode key listener so readline can read
+        // a full line. We reinstall it after the question resolves. During
+        // the prompt window, the process-level SIGINT handler is still
+        // set to plain process.exit (we're parked), so Ctrl+C during typing
+        // quits cleanly.
+        process.stdin.removeListener("data", handleKey);
+        if (process.stdin.isTTY) process.stdin.setRawMode(false);
+
+        const rl = readline.createInterface({
+          input: process.stdin,
+          output: process.stdout,
+        });
+        rl.question("Enter Meet URL: ", (answer) => {
+          rl.close();
+          const trimmed = answer.trim();
+          if (trimmed) {
+            MEET_URL = trimmed;
+            process.stdout.write(`URL set to ${MEET_URL}\n`);
+          } else {
+            process.stdout.write("(unchanged)\n");
+          }
+          // Reinstall raw-mode listener and reprint the parked prompt so
+          // the user sees the refreshed URL in the hotkey legend.
+          if (process.stdin.isTTY) process.stdin.setRawMode(true);
+          process.stdin.resume();
+          process.stdin.on("data", handleKey);
+          printParkedPrompt();
+        });
+        return;
+      }
+    };
+
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on("data", handleKey);
   });
 }
 
