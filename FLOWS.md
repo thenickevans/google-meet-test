@@ -86,10 +86,18 @@ Columns: what the user provided. Rows: what happens. `—` = flag absent.
 | parked | c | prompt for URL | parked |
 | parked | Ctrl+C | `process.exit(0)` | — |
 | active | 1 / 2 / 3 | hot-swap mode via `installModeHook` | active(newMode) |
-| active | a | soft-leave + rebuild with flipped anon, preserve mode | active(sameMode, flipped anon) |
+| active | a | soft-leave + rebuild with flipped anon, preserve mode + transcribing | active(sameMode, flipped anon) |
 | active | l | soft-leave, return to parked | parked |
+| active | t | toggle transcription (spawn/kill `transcribe.py`); mutually exclusive with typing | active(sameMode, transcribing flipped) |
+| active | y | enter typing submode (live keystrokes → canvas); auto-disables transcribing | active(sameMode, typing=on) |
+| active | Shift+Y | clear typedText | active |
+| active | Esc | transcribing: clear transcript. typing: exit typing submode (text persists). | active |
 | active | ? | print legend | active |
 | active | Ctrl+C | `exitHandler.leave()` (full teardown) | — |
+| typing | Esc | exit typing submode, typedText persists | active |
+| typing | Enter / Backspace / printable chars | edit typedText, live-push to canvas | typing |
+| typing | 1 / 2 / 3 / t / y / a / l | treated as literal characters (NOT hotkeys) | typing |
+| typing | Ctrl+C | `exitHandler.leave()` | — |
 
 ---
 
@@ -147,6 +155,12 @@ affected. Full pass is 5-10 min; targeted changes are usually 1-2 rows.
 | H6 | parked | `c` | Prompt for URL. | ☐ |
 | H7 | parked | Ctrl+C | Exit cleanly. | ☐ |
 | H8 | active | Ctrl+C | Full teardown via exitHandler. | ☐ |
+| H9 | active | `t` | Toggle transcription on/off; python spawned/killed; canvas driven by transcript when on, mode label when off. | ☐ 2026-04-16 (on path) |
+| H10 | active+transcribing | `a` | Auth toggle; transcription resumes after rebuild under new page. | ☐ |
+| H11 | active | `y` | Enter typing submode; live keystrokes land on canvas. Auto-disables transcribing. | ☐ |
+| H12 | typing | Esc | Exit typing submode; typedText persists on canvas. | ☐ |
+| H13 | typing | `1`/`2`/`3`/`t`/`a`/`l` | Appended as text (NOT hotkeys). | ☐ |
+| H14 | active | `Shift+Y` | Clear typedText; canvas reverts to mode label (or transcript if transcribing). | ☐ |
 
 ### 3e. Outstanding bugs / unverified cases (from backlog)
 
@@ -158,6 +172,7 @@ affected. Full pass is 5-10 min; targeted changes are usually 1-2 rows.
 - [ ] Incognito Chrome windows — does AppleScript see them?
 - [ ] Non-Chrome browsers (Safari/Arc/Brave/Edge) — generalize detection.
 - [ ] **runInputLoop crashes on non-TTY stdin** — `join.js:2221` calls `process.stdin.setRawMode(true)` without a `process.stdin.isTTY` guard. If stdin is piped/redirected (e.g., running under CI, background job, non-interactive shell), throws `TypeError: setRawMode is not a function`. Other call sites in the file guard correctly (e.g., `join.js:2590`, `2612`). Fix: add `if (process.stdin.isTTY)` guard, and probably short-circuit the entire input loop to a no-op wait when there's no TTY. Found 2026-04-16 while testing Ctrl+C orphan behavior.
+- [x] **`--interactive` ignored `--source`** — until 2026-04-16, `runHotkeyLoop` only handled mode-swap hotkeys (1/2/3/a/l/?) and the canvas showed mode labels (`"Camera Mode"` etc.). Typed keystrokes and the transcription feed were silently dropped, even though `printConfig` printed `source=${source}` as if it mattered. Root cause: interactive mode was designed purely to demo hot-swapping render pipelines; the source-of-text wiring lived only in `runInputLoop` (the non-interactive path). **Fixed 2026-04-16:** (1) `t` toggles transcription on/off at runtime — spawns/kills python tied to the current page. (2) `y` enters a modal typing submode: every keystroke lands on the canvas live; Esc exits; typedText persists so mode swaps preserve it; Shift+Y clears. Transcription and typing are mutually exclusive (enabling one disables the other). Transcription state is preserved across auth-toggle rebuilds; typedText is not (fresh-start assumption — change if needed).
 - [x] **Ctrl+C orphan processes** — verified 2026-04-16: no leaks in camera/typed, camera/transcribed, or SIGINT-during-setup paths. Chrome, python, and node all reaped. Exit handler's 5s force-quit safety net never triggered.
 
 See `~/.claude/projects/-Users-nickevans-google-meet-test/memory/project_next_steps.md`

@@ -398,6 +398,30 @@ const ANONYMOUS_PROFILE_DIR = `${os.homedir()}/.google-meet-test-chrome-profile-
 // =========================================================================
 // MAIN
 // =========================================================================
+// Spawn transcribe.py tied to a given page + exit handler. Pushes a
+// "Loading speech-to-text..." placeholder to the canvas so the user knows
+// Whisper is warming up; python's 'ready' event clears that when it's
+// live. Callable from two places: the main IIFE (pre-join spawn when the
+// user launched with --source transcribed) and runHotkeyLoop (the `t`
+// toggle that flips transcription on mid-meeting).
+async function spawnTranscribe(page, exitHandler) {
+  await page
+    .evaluate((color) => {
+      window.__segments = [{ text: "Loading speech-to-text...", color }];
+      window.__botText = "Loading speech-to-text...";
+    }, PARTIAL_COLOR)
+    .catch(() => {});
+  const proc = startTranscribe(page, null, null);
+  if (proc) exitHandler.setPythonProc(proc);
+  return proc;
+}
+function killTranscribe(proc) {
+  if (!proc || proc.killed) return;
+  try {
+    proc.kill("SIGTERM");
+  } catch {}
+}
+
 (async () => {
   printConfig();
 
@@ -452,6 +476,12 @@ const ANONYMOUS_PROFILE_DIR = `${os.homedir()}/.google-meet-test-chrome-profile-
     let session = await setupSession(currentAnonymous);
     printTimings();
     sigintRef.handler = session.exitHandler;
+    // Initial python spawn only if the user passed --source transcribed on
+    // the CLI. Otherwise runHotkeyLoop's `t` key is the way to turn it on.
+    let initialProc =
+      source === "transcribed"
+        ? await spawnTranscribe(session.page, session.exitHandler)
+        : null;
 
     let parked = false;
     while (!parked) {
@@ -464,12 +494,15 @@ const ANONYMOUS_PROFILE_DIR = `${os.homedir()}/.google-meet-test-chrome-profile-
         })
         .catch(() => null);
 
-      const { signal, lastMode } = await runHotkeyLoop(
+      const { signal, lastMode, transcribing } = await runHotkeyLoop(
         session.page,
         session.exitHandler,
         currentAnonymous,
-        initialMode
+        initialMode,
+        initialProc
       );
+      // The loop kills its own python on exit, so we don't need to here.
+      initialProc = null;
 
       // runHotkeyLoop resolves with a rebuild signal. Ctrl+C routes
       // through exitHandler.leave() which calls process.exit, so we never
@@ -485,6 +518,11 @@ const ANONYMOUS_PROFILE_DIR = `${os.homedir()}/.google-meet-test-chrome-profile-
         session = await setupSession(currentAnonymous);
         printTimings();
         sigintRef.handler = session.exitHandler;
+        // Preserve transcription state across the rebuild: if the user had
+        // it on pre-switch, spin up a fresh python tied to the new page.
+        initialProc = transcribing
+          ? await spawnTranscribe(session.page, session.exitHandler)
+          : null;
         initialMode = lastMode; // preserve the active mode across the rebuild
       } else {
         // park: soft-leave and break out to the outer parked phase.
@@ -2290,7 +2328,7 @@ async function runInputLoop(page, exitHandler) {
 // practice this promise either resolves with "switch-auth" or never
 // resolves at all.
 // =========================================================================
-async function runHotkeyLoop(page, exitHandler, isAnonymous, initialMode) {
+async function runHotkeyLoop(page, exitHandler, isAnonymous, initialMode, initialProc) {
   // Track presentation state on the Node side because Meet's UI is the
   // source of truth for whether we're sharing — we drive that via clicks.
   let isPresenting = false;
@@ -2299,6 +2337,19 @@ async function runHotkeyLoop(page, exitHandler, isAnonymous, initialMode) {
   // picks this via the 1/2/3 hotkeys; after an auth-toggle rebuild, the
   // main loop passes the pre-rebuild mode here to preserve it.
   let currentMode = initialMode || "camera";
+  // Transcription is toggleable via `t`. When on, the python feed drives
+  // the canvas and the mode-label push below is suppressed (otherwise a
+  // 1/2/3 swap would clobber the live transcript). When off, the canvas
+  // shows the mode label.
+  let pythonProc = initialProc || null;
+  let transcribing = !!pythonProc;
+  // Typed-text state. `y` enters typing mode (all keystrokes → canvas,
+  // live). Esc exits typing mode; typedText persists across swaps so users
+  // can keep a tagline up while demoing different pipelines. Shift+Y
+  // clears. Typing and transcribing are mutually exclusive — only one
+  // source can drive the canvas at a time.
+  let typing = false;
+  let typedText = "";
 
   const MODE_LABELS = {
     camera: "Camera Mode",
@@ -2306,28 +2357,40 @@ async function runHotkeyLoop(page, exitHandler, isAnonymous, initialMode) {
     presentation: "Presentation Mode",
   };
 
-  function legend() {
-    return [
-      "Interactive mode — hot-swap render pipelines with one key.",
-      "  1   camera        (synthetic dark text canvas)",
-      "  2   camera-overlay (real webcam + lower-third pill)",
-      "  3   presentation  (text canvas + 1920x1080 slide via screen share)",
-      `  a   toggle auth mode (currently: ${isAnonymous ? "anonymous" : "signed in"}) — leaves and rejoins`,
-      "  l   leave the meeting (stay parked — press j to rejoin)",
-      "  ?   show this legend",
-      "  Ctrl+C   quit the CLI",
-    ].join("\n");
-  }
-
-  // Print the legend once at startup. Each subsequent mode change writes a
-  // single status line without clearing — keeps the scrollback intact so
-  // you can see the history of what you pressed.
+  // Boxed legend. Groups keys by purpose (Render / Text / Session) so the
+  // user can find any hotkey by its role without reading the whole thing.
+  // Live-state bits (meeting code, auth mode, 🎤 on/off) ride in the top
+  // border so the box itself is a glance-able status indicator; pressing
+  // `?` reprints it to pick up any state change.
   function printLegendOnce() {
-    process.stdout.write(
-      `Interactive  |  ${MEET_URL}  |  auth: ${isAnonymous ? "anonymous" : "signed in"}\n`
+    const url = MEET_URL || "(not set)";
+    const match = url.match(
+      /meet\.google\.com\/([a-z]{3}-[a-z]{3,4}-[a-z]{3})/i
     );
-    process.stdout.write(legend() + "\n");
-    process.stdout.write("─".repeat(72) + "\n");
+    const code = match ? match[1] : url;
+    const auth = isAnonymous ? "anonymous" : "signed in";
+    const mic = transcribing ? "🎤 on" : "🎤 off";
+    const title = `Interactive · ${code} · ${auth} · ${mic}`;
+    const width = 72;
+
+    // Width accounting: emoji (astral-plane codepoints) render as 2 cells
+    // in most monospace fonts; box-drawing, middle-dots, etc. are 1 cell.
+    // The >0xFFFF threshold catches 🎤 without miscounting · or ┌.
+    const topInner = `┌─ ${title} `;
+    let topInnerWidth = 0;
+    for (const c of topInner) {
+      topInnerWidth += c.codePointAt(0) > 0xffff ? 2 : 1;
+    }
+    const topPad = "─".repeat(Math.max(0, width - topInnerWidth));
+
+    const lines = [
+      topInner + topPad,
+      "│  Render:   [1] camera   [2] overlay   [3] present",
+      "│  Text:     [t] transcription   [y] type (Esc to exit)   [Shift+Y] clear",
+      "│  Session:  [a] toggle auth   [l] leave   [?] help   [^C] quit",
+      "└" + "─".repeat(width - 1),
+    ];
+    process.stdout.write(lines.join("\n") + "\n");
   }
 
   function printStatus() {
@@ -2364,7 +2427,25 @@ async function runHotkeyLoop(page, exitHandler, isAnonymous, initialMode) {
         window.__currentMode = m;
       }, next)
       .catch(() => {});
-    await setSegmentsToLabel(MODE_LABELS[next]);
+    // Canvas source priority: transcription > typed > mode label. Skip the
+    // label push if either user-driven source is active, otherwise we'd
+    // stomp the transcript or typed text on every 1/2/3 swap.
+    if (!transcribing && !typedText.length) {
+      await setSegmentsToLabel(MODE_LABELS[next]);
+    }
+  }
+
+  // Push the current typedText to the canvas. Whitespace fallback keeps
+  // the segment bus non-empty so the canvas renderer has something to lay
+  // out (empty strings were causing a flash of the placeholder).
+  async function pushTypedCanvas() {
+    await page
+      .evaluate((t) => {
+        const display = t.length ? t : " ";
+        window.__segments = [{ text: display, color: "#ffffff" }];
+        window.__botText = t;
+      }, typedText)
+      .catch(() => {});
   }
 
   // Initial state: set the label for the chosen mode. If the caller chose
@@ -2413,6 +2494,14 @@ async function runHotkeyLoop(page, exitHandler, isAnonymous, initialMode) {
         await stopPresenting(page).catch(() => false);
         isPresenting = false;
       }
+      // Snapshot transcribing state before we kill python so the caller
+      // knows whether to respawn after a switch-auth rebuild. The kill
+      // itself happens here so park doesn't leave an orphan whisper proc
+      // and switch-auth doesn't have python talking to a stale page.
+      const wasTranscribing = transcribing;
+      killTranscribe(pythonProc);
+      pythonProc = null;
+      transcribing = false;
       // transitioning stays true — we're exiting this loop for good.
       process.stdin.removeListener("data", handleKey);
       // Drop raw mode so the next session (or a post-exit shell) doesn't
@@ -2423,16 +2512,58 @@ async function runHotkeyLoop(page, exitHandler, isAnonymous, initialMode) {
       // Return the current mode too so the main loop can preserve it
       // across an auth-toggle rebuild (for park, the next join will pick
       // its own mode via the idle loop so lastMode is unused).
-      resolve({ signal, lastMode: currentMode });
+      resolve({ signal, lastMode: currentMode, transcribing: wasTranscribing });
     };
 
     const handleKey = async (key) => {
       if (exitHandler.isLeaving()) return;
 
-      // Ctrl+C — leave.
+      // Ctrl+C — leave. Always first, so the user can bail out of any
+      // submode (typing, transcribing-with-Esc-clear) without getting stuck.
       if (key[0] === 3) {
         process.stdout.write("\n");
         exitHandler.leave();
+        return;
+      }
+
+      // Typing mode: consume every other keystroke as text input. Mode-swap
+      // hotkeys (1/2/3) and other commands are suspended until Esc exits
+      // typing mode — otherwise a `3` typed into a sentence would detonate
+      // a presentation start.
+      if (typing) {
+        // Esc — exit typing mode. typedText persists so mode swaps still
+        // show the text; Shift+Y clears it explicitly.
+        if (key[0] === 27 && key.length === 1) {
+          typing = false;
+          process.stdout.write("→ typing: off (text persists — Shift+Y to clear)\n");
+          return;
+        }
+        // Enter — append a newline.
+        if (key[0] === 13) {
+          typedText += "\n";
+          await pushTypedCanvas();
+          return;
+        }
+        // Backspace or Delete.
+        if (key[0] === 127 || key[0] === 8) {
+          if (typedText.length > 0) {
+            typedText = typedText.slice(0, -1);
+            await pushTypedCanvas();
+          }
+          return;
+        }
+        // Any printable character.
+        const inputCh = key.toString();
+        if (inputCh && !inputCh.match(/[\x00-\x1f]/)) {
+          typedText += inputCh;
+          await pushTypedCanvas();
+        }
+        return;
+      }
+
+      // Escape — clear the transcript (only meaningful when transcribing).
+      if (transcribing && key[0] === 27 && key.length === 1) {
+        await pythonProc.__clearState?.();
         return;
       }
 
@@ -2520,6 +2651,81 @@ async function runHotkeyLoop(page, exitHandler, isAnonymous, initialMode) {
         } finally {
           transitioning = false;
         }
+        return;
+      }
+
+      if (ch === "t" || ch === "T") {
+        // Toggle transcription on/off. Spawns/kills python tied to the
+        // current page; runs inline (no session rebuild).
+        if (transitioning) return;
+        transitioning = true;
+        try {
+          if (transcribing) {
+            killTranscribe(pythonProc);
+            pythonProc = null;
+            transcribing = false;
+            // Revert the canvas to typed text if the user has some queued,
+            // otherwise the current mode label. Otherwise the dead
+            // transcript frame would linger.
+            if (typedText.length) {
+              await pushTypedCanvas();
+            } else {
+              await setSegmentsToLabel(MODE_LABELS[currentMode]);
+            }
+            process.stdout.write("→ transcription: off\n");
+          } else {
+            pythonProc = await spawnTranscribe(page, exitHandler);
+            if (pythonProc) {
+              transcribing = true;
+              process.stdout.write(
+                "→ transcription: ON (Whisper model loading...)\n"
+              );
+            } else {
+              process.stdout.write(
+                "→ transcription: failed to start (see error above)\n"
+              );
+            }
+          }
+        } finally {
+          transitioning = false;
+        }
+        return;
+      }
+
+      if (ch === "y") {
+        // Enter typing mode. Mutually exclusive with transcribing — flip
+        // transcription off first so python doesn't keep clobbering the
+        // canvas while the user types.
+        if (transitioning) return;
+        transitioning = true;
+        try {
+          if (transcribing) {
+            killTranscribe(pythonProc);
+            pythonProc = null;
+            transcribing = false;
+            process.stdout.write(
+              "→ transcription auto-disabled (typing takes over)\n"
+            );
+          }
+          typing = true;
+          await pushTypedCanvas();
+          process.stdout.write(
+            "→ typing: ON — type to update the canvas. Esc to exit, Ctrl+C to quit.\n"
+          );
+        } finally {
+          transitioning = false;
+        }
+        return;
+      }
+
+      if (ch === "Y") {
+        // Clear typed text. Works whether or not we're currently in typing
+        // mode — a quick "reset the tagline" while demoing.
+        typedText = "";
+        if (!transcribing) {
+          await setSegmentsToLabel(MODE_LABELS[currentMode]);
+        }
+        process.stdout.write("→ typed text cleared\n");
         return;
       }
 
